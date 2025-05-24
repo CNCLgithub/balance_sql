@@ -43,8 +43,8 @@ const db = new sqlite3.Database(
         CREATE TABLE IF NOT EXISTS condition_counts (
           session_id TEXT NOT NULL,
           condition_id INTEGER NOT NULL CHECK (condition_id BETWEEN 1 AND ${ncond}),
-          user_count INTEGER DEFAULT 0,
-          last_assigned_condition INTEGER DEFAULT 0,
+          completed INTEGER DEFAULT 0,
+          pending INTEGER DEFAULT 0,
           PRIMARY KEY (session_id, condition_id)
         )
       `);
@@ -107,48 +107,27 @@ app.get('/assign-condition', async (req, res) => {
     if (!sessionExists) {
       const values = Array.from({ length: ncond }, (_, i) => `('${session_id}', ${i + 1}, 0, 0)`).join(', ');
       await dbRun(`
-            INSERT INTO condition_counts (session_id, condition_id, user_count, last_assigned_condition)
+            INSERT INTO condition_counts (session_id, condition_id, completed, pending)
             VALUES ${values}
           `);
       console.log(`Initialized session ${session_id} with ${ncond} conditions.`);
     }
 
-    // Get the last assigned condition for the session (use MAX to aggregate across conditions)
-    const lastAssigned = await dbGet(`
-          SELECT MAX(last_assigned_condition) as last_assigned
+    // Select conditions with the minimum completed count
+    const counts = await dbAll(`
+          SELECT condition_id, pending, completed
           FROM condition_counts
           WHERE session_id = ?
         `, [session_id]);
 
-    const lastAssignedCondition = lastAssigned ? lastAssigned.last_assigned : 0;
-
-    // Select all conditions with the minimum user count for the session
-    const minConditions = await dbAll(`
-          SELECT condition_id
-          FROM condition_counts
-          WHERE session_id = ?
-          AND user_count = (
-            SELECT MIN(user_count)
-            FROM condition_counts
-            WHERE session_id = ?
-          )
-          ORDER BY condition_id
-        `, [session_id, session_id]);
-
-    if (!minConditions || minConditions.length === 0) {
+    if (!counts || counts.length === 0) {
       throw new Error(`No conditions available for session ${session_id}`);
     }
 
-    // Round-robin: Select the next condition after last_assigned_condition
-    let conditionId;
-    const conditionIds = minConditions.map(c => c.condition_id);
-    if (lastAssignedCondition === 0) {
-      conditionId = conditionIds[0]; // Start with the first minimum condition
-    } else {
-      const lastIndex = conditionIds.indexOf(lastAssignedCondition);
-      const nextIndex = lastIndex === -1 || lastIndex === conditionIds.length - 1 ? 0 : lastIndex + 1;
-      conditionId = conditionIds[nextIndex];
-    }
+    const conditionWeights = counts.map(c => c.completed + 0.95 * c.pending);
+    const minWeight = Math.min(...conditionWeights);
+    const minIndex = conditionWeights.indexOf(minWeight);
+    const conditionId = counts[minIndex].condition_id;
 
     // Insert user with pending status
     await dbRun(`
@@ -156,13 +135,12 @@ app.get('/assign-condition', async (req, res) => {
       VALUES (?, ?, ?, 'pending')
     `, [prolific_pid, session_id, conditionId]);
 
-    // Update last_assigned_condition for the session (update all rows to simplify)
+    // Increment pending count
     await dbRun(`
           UPDATE condition_counts
-          SET last_assigned_condition = ?
-          WHERE session_id = ?
-        `, [conditionId, session_id]);
-
+          SET pending = pending + 1
+          WHERE session_id = ? AND condition_id = ?
+        `, [session_id, conditionId]);
     // Commit transaction
     await dbRun('COMMIT');
     console.log(`User ${prolific_pid} in session ${session_id} assigned to condition ${conditionId} as pending`);
@@ -191,10 +169,10 @@ app.post('/confirm-condition', async (req, res) => {
 
     // Verify user exists and is pending in the session
     const user = await dbGet(`
-        SELECT condition_id, status
-        FROM user_conditions
-        WHERE user_id = ? AND session_id = ?
-      `, [prolific_pid, session_id]);
+          SELECT condition_id, status
+          FROM user_conditions
+          WHERE user_id = ? AND session_id = ?
+        `, [prolific_pid, session_id]);
 
     if (!user) {
       throw new Error(`User ${prolific_pid} not found in session ${session_id}`);
@@ -210,13 +188,13 @@ app.post('/confirm-condition', async (req, res) => {
         WHERE user_id = ? AND session_id = ?
       `, [prolific_pid, session_id]);
 
-    // Increment condition count for the session
+    // Decrement pending count and increment completed count
     await dbRun(`
-        UPDATE condition_counts
-        SET user_count = user_count + 1
-        WHERE session_id = ? AND condition_id = ?
-      `, [session_id, user.condition_id]);
-
+          UPDATE condition_counts
+          SET pending = pending - 1,
+              completed = completed + 1
+          WHERE session_id = ? AND condition_id = ?
+        `, [session_id, user.condition_id]);
     // Commit transaction
     await dbRun('COMMIT');
     console.log(`Confirmed ${prolific_pid} in session ${session_id} for condition ${user.condition_id}`);
