@@ -5,7 +5,7 @@ const simulate_connection = async ({ page }) => {
   page.on("pageerror", err => {
     console.log(err.message)
   })
-  await page.goto('http://127.0.0.1:9000/publix/k4ZRJrVJ2Dm');
+  await page.goto('http://127.0.0.1:9000/publix/DsXDfQPxyI3');
   await page.waitForURL('**/endPage.html');
 };
 

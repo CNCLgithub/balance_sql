@@ -66,11 +66,7 @@ const dbRun = util.promisify(db.run.bind(db));
 const dbGet = util.promisify(db.get.bind(db));
 const dbAll = util.promisify(db.all.bind(db));
 
-
-// Endpoint to assign a candidate condition
-app.get('/assign-condition', async (req, res) => {
-  const prolific_pid = req.query.prolific_pid || 'unknown';
-  const session_id = req.query.session_id || 'unknown';
+async function assign_condition(prolific_pid, session_id) {
   const release = await dbMutex.acquire();
   try {
     // Begin transaction
@@ -89,10 +85,9 @@ app.get('/assign-condition', async (req, res) => {
       const conditionId = existingAssignment.condition_id;
       console.log(
         `User ${prolific_pid} in session ${session_id} ` +
-        `already assigned to condition ${condition_id}`
+        `already assigned to condition ${conditionId}`
       );
-      res.json({ condition: conditionId });
-      return;
+      return conditionId;
     }
 
     // Check if session exists in condition_counts
@@ -145,23 +140,34 @@ app.get('/assign-condition', async (req, res) => {
     await dbRun('COMMIT');
     console.log(`User ${prolific_pid} in session ${session_id} assigned to condition ${conditionId} as pending`);
     // Return candidate condition
-    res.json({ condition: conditionId });
+    return conditionId;
   } catch (err) {
     // Rollback on error
+    const err_msg = `Error assigning user ${prolific_pid} in session `+
+          `${session_id}: ${err.message}`;
+    console.error(err_msg);
     await dbRun('ROLLBACK');
-    console.error(`Error assigning user ${prolific_pid} in session ${session_id}:`, err);
-    res.status(500).json({ error: `Error assigning user ${prolific_pid} in session ${session_id}:` });
+    throw new Error(err_msg);
   } finally {
     release();
   }
+}
+
+// Endpoint to assign a candidate condition
+app.get('/assign-condition', async (req, res) => {
+  const prolific_pid = req.query.prolific_pid || 'unknown';
+  const session_id = req.query.session_id || 'unknown';
+  await assign_condition(prolific_pid, session_id)
+    .then((conditionId) => {
+      res.json({ condition: conditionId });
+    })
+    .catch((error) => {
+      res.status(500).json({ error: error.message });
+    });
 });
 
-// Endpoint to confirm a condition assignment
-app.post('/confirm-condition', async (req, res) => {
-  const { prolific_pid, session_id } = req.body;
-  if (!prolific_pid || !session_id) {
-    return res.status(400).json({ error: 'Missing subject or session id' });
-  }
+
+async function confirm_condition(prolific_pid, session_id) {
   const release = await dbMutex.acquire();
   try {
     // Begin transaction
@@ -198,22 +204,38 @@ app.post('/confirm-condition', async (req, res) => {
     // Commit transaction
     await dbRun('COMMIT');
     console.log(`Confirmed ${prolific_pid} in session ${session_id} for condition ${user.condition_id}`);
-    res.json({ status: "success" });
-    return;
+    return user.condition_id;
   } catch (err) {
     // Rollback on error
     await dbRun('ROLLBACK');
     const err_msg =
       `Could not confirm user ${prolific_pid} in session ${session_id}: ` +
       err.message;
-    console.error(err_msg);
-    res.status(500).json({ error: err_msg });
+    throw new Error(err_msg);
   } finally {
     release();
   }
+}
+
+// Endpoint to confirm a condition assignment
+app.post('/confirm-condition', async (req, res) => {
+  const { prolific_pid, session_id } = req.body;
+  if (!prolific_pid || !session_id) {
+    res.status(400).json({ error: 'Missing subject or session id' });
+    return;
+  }
+  await confirm_condition(prolific_pid, session_id)
+    .then(() => {
+      res.json({ status: "success" });
+    })
+    .catch(async (error) => {
+      res.status(500).json({ error: error.message });
+    });
 });
 
 // Start server
 app.listen(port, () => {
   console.log(`Server running at http://${server_address}:${port}`);
 });
+
+module.exports = { assign_condition, confirm_condition, dbAll };
